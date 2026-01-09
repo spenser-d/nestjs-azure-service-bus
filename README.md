@@ -21,11 +21,39 @@ A fully-featured NestJS custom transporter for Azure Service Bus with pub-sub (T
 
 ## Installation
 
+### From npm
+
 ```bash
 npm install @nestjs-azure/service-bus @azure/service-bus
 ```
 
+### From GitHub
+
+You can install directly from GitHub without the package being published to npm:
+
+```bash
+# Latest from main branch
+npm install github:spenser-d/nestjs-azure-service-bus @azure/service-bus
+
+# Specific version (recommended)
+npm install github:spenser-d/nestjs-azure-service-bus#v0.1.0 @azure/service-bus
+```
+
+Or add to your `package.json` dependencies:
+
+```json
+{
+  "dependencies": {
+    "@nestjs-azure/service-bus": "github:spenser-d/nestjs-azure-service-bus#v0.1.0",
+    "@azure/service-bus": "^7.9.0"
+  }
+}
+```
+
+### Azure AD Authentication (optional)
+
 For Azure AD authentication (recommended for production):
+
 ```bash
 npm install @azure/identity
 ```

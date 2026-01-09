@@ -35,7 +35,8 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r ts-node/register node_modules/.bin/jest --runInBand",
-    "prepublishOnly": "npm run build"
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run lint && npm run test"
   },
   "dependencies": {
     "@azure/service-bus": "^7.9.0"
