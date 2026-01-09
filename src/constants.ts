@@ -4,6 +4,13 @@
 export const SERVICE_BUS_TRANSPORT = Symbol('SERVICE_BUS_TRANSPORT');
 
 /**
+ * Error message when no handler is found for a pattern
+ * Matches NestJS convention from @nestjs/microservices
+ */
+export const NO_MESSAGE_HANDLER =
+  'There is no matching message handler defined in the remote service.';
+
+/**
  * Injection tokens
  */
 export const SERVICE_BUS_CLIENT_INSTANCE = Symbol('SERVICE_BUS_CLIENT_INSTANCE');

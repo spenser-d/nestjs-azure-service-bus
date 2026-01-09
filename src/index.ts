@@ -7,6 +7,9 @@ export * from './interfaces';
 // Errors
 export * from './errors';
 
+// Record Builders (NestJS convention like RmqRecord)
+export * from './record-builders';
+
 // Serializers
 export * from './serializers';
 
@@ -15,6 +18,9 @@ export * from './server';
 
 // Client
 export * from './client';
+
+// Admin (Service Bus entity management)
+export * from './admin';
 
 // Decorators
 export * from './decorators';

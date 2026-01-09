@@ -16,7 +16,14 @@ A fully-featured NestJS custom transporter for Azure Service Bus with pub-sub (T
 - **Request-Response Pattern** - Full support for send/receive patterns via shared reply queue
 - **Event Pattern** - Fire-and-forget message publishing with `emit()`
 - **Custom Decorators** - `@ServiceBusSubscription`, `@DeadLetterHandler`, `@ServiceBusCtx`
+- **ServiceBusRecord Builder** - Per-message options with fluent API (like RmqRecord)
+- **Batch Operations** - Efficient batch sending of multiple messages
+- **Message Browsing** - Peek messages without consuming them
+- **Deferred Messages** - Defer and retrieve messages by sequence number
+- **Administration Service** - Manage queues, topics, subscriptions, and rules programmatically
+- **Connection Events** - Subscribe to connect/disconnect events for observability
 - **Comprehensive Error Handling** - Typed errors for connection, authentication, settlement, and session issues
+- **Full NestJS Convention Compliance** - Aligned with official NestJS microservices patterns
 - **Full TypeScript Support** - Complete type definitions included
 
 ## Installation
@@ -286,6 +293,231 @@ export class OrderService {
   }
 }
 ```
+
+## ServiceBusRecord (Per-Message Options)
+
+Similar to NestJS's `RmqRecord`, the `ServiceBusRecord` allows you to set per-message options:
+
+```typescript
+import { ServiceBusRecord, ServiceBusRecordBuilder } from '@nestjs-azure/service-bus';
+
+// Using constructor directly
+const record = new ServiceBusRecord(
+  { orderId: '12345', amount: 99.99 },
+  { sessionId: 'user-abc', timeToLiveMs: 60000 }
+);
+client.send('process-order', record).subscribe();
+
+// Using fluent builder (recommended)
+const record = new ServiceBusRecordBuilder<OrderData>()
+  .setData({ orderId: '12345', amount: 99.99 })
+  .setSessionId('user-abc')
+  .setTimeToLive(60000)
+  .setSubject('order-created')
+  .setApplicationProperties({ priority: 'high', region: 'us-west' })
+  .build();
+
+client.send('process-order', record).subscribe();
+client.emit('order-created', record);
+```
+
+### Available Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `sessionId` | `string` | Session ID for session-enabled entities |
+| `partitionKey` | `string` | Partition key for message grouping |
+| `correlationId` | `string` | Custom correlation ID |
+| `contentType` | `string` | Content type (default: `application/json`) |
+| `subject` | `string` | Subject/label for the message |
+| `timeToLiveMs` | `number` | Time to live in milliseconds |
+| `scheduledEnqueueTimeUtc` | `Date` | Scheduled delivery time |
+| `messageId` | `string` | Custom message ID |
+| `replyTo` | `string` | Reply-to address |
+| `replyToSessionId` | `string` | Reply-to session ID |
+| `applicationProperties` | `Record<string, any>` | Custom properties |
+
+## Batch Operations
+
+Send multiple messages efficiently:
+
+```typescript
+// Simple batch (array of messages)
+await client.sendMany('create-order', [
+  { orderId: '1', amount: 10 },
+  { orderId: '2', amount: 20 },
+  { orderId: '3', amount: 30 },
+]);
+
+// Advanced batch with size control
+const batch = await client.createMessageBatch('orders');
+for (const order of largeOrderList) {
+  const message = client.serializeMessage('create-order', order);
+  if (!batch.tryAddMessage(message)) {
+    // Batch is full, send it and create a new one
+    await client.sendBatch(batch, 'orders');
+    batch = await client.createMessageBatch('orders');
+    batch.tryAddMessage(message);
+  }
+}
+// Send remaining messages
+await client.sendBatch(batch, 'orders');
+```
+
+## Message Browsing (Peek)
+
+Peek messages without consuming them:
+
+```typescript
+// Peek first 10 messages
+const messages = await client.peekMessages('orders', 'processor', 10);
+for (const msg of messages) {
+  console.log('Preview:', msg.body);
+}
+
+// Peek from dead letter queue
+const dlqMessages = await client.peekDeadLetterMessages('orders', 'processor', 10);
+```
+
+## Deferred Messages
+
+Defer messages for later processing:
+
+```typescript
+// In handler - defer the message
+@MessagePattern('process-order')
+async handleOrder(data: OrderData, @Ctx() ctx: ServiceBusContext) {
+  if (!isReadyToProcess()) {
+    // Store the sequence number for later
+    const sequenceNumber = ctx.getSequenceNumber();
+    await storeDeferredSequenceNumber(sequenceNumber);
+    await ctx.defer();
+    return;
+  }
+  // Process normally...
+}
+
+// Later - retrieve and process deferred messages
+const sequenceNumbers = await getStoredDeferredSequenceNumbers();
+const messages = await client.receiveDeferredMessages(
+  'orders',
+  'processor',
+  sequenceNumbers,
+);
+
+for (const msg of messages) {
+  await processOrder(msg.body);
+}
+```
+
+## Connection Events
+
+Subscribe to connection state changes:
+
+```typescript
+const client = new ServiceBusClientProxy(options);
+
+client.on('connected', () => {
+  console.log('Connected to Service Bus');
+});
+
+client.on('disconnected', (error) => {
+  console.log('Disconnected:', error?.message);
+});
+
+client.on('error', (error) => {
+  console.error('Connection error:', error);
+});
+
+await client.connect();
+```
+
+## Administration Service
+
+Manage Azure Service Bus entities programmatically:
+
+### Setup
+
+```typescript
+import { ServiceBusAdminModule } from '@nestjs-azure/service-bus';
+
+@Module({
+  imports: [
+    ServiceBusAdminModule.forRoot({
+      connectionString: process.env.SERVICE_BUS_CONNECTION_STRING,
+    }),
+    // Or with async configuration
+    ServiceBusAdminModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: (config: ConfigService) => ({
+        connectionString: config.get('SERVICE_BUS_CONNECTION_STRING'),
+      }),
+      inject: [ConfigService],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### Using the Admin Service
+
+```typescript
+import { ServiceBusAdminService } from '@nestjs-azure/service-bus';
+
+@Injectable()
+export class SetupService {
+  constructor(private readonly admin: ServiceBusAdminService) {}
+
+  async setupInfrastructure() {
+    // Ensure topic exists
+    await this.admin.ensureTopic('orders');
+
+    // Create subscription with filter
+    await this.admin.createSubscription('orders', 'high-priority', {
+      defaultRuleOptions: {
+        name: 'high-priority-filter',
+        filter: this.admin.createSqlFilter("priority = 'high'"),
+      },
+    });
+
+    // Add another filter rule
+    await this.admin.createRule(
+      'orders',
+      'high-priority',
+      'region-filter',
+      this.admin.createCorrelationFilter({
+        applicationProperties: { region: 'us-west' },
+      }),
+    );
+
+    // Get runtime info
+    const info = await this.admin.getSubscriptionRuntimeProperties('orders', 'high-priority');
+    console.log('Active messages:', info.activeMessageCount);
+    console.log('Dead letter count:', info.deadLetterMessageCount);
+  }
+}
+```
+
+### Available Operations
+
+**Queues:**
+- `createQueue`, `getQueue`, `updateQueue`, `deleteQueue`, `queueExists`
+- `getQueueRuntimeProperties`, `listQueues`, `listQueuesRuntimeProperties`
+- `ensureQueue` - create if not exists
+
+**Topics:**
+- `createTopic`, `getTopic`, `updateTopic`, `deleteTopic`, `topicExists`
+- `getTopicRuntimeProperties`, `listTopics`, `listTopicsRuntimeProperties`
+- `ensureTopic` - create if not exists
+
+**Subscriptions:**
+- `createSubscription`, `getSubscription`, `updateSubscription`, `deleteSubscription`, `subscriptionExists`
+- `getSubscriptionRuntimeProperties`, `listSubscriptions`, `listSubscriptionsRuntimeProperties`
+- `ensureSubscription` - create if not exists
+
+**Rules/Filters:**
+- `createRule`, `getRule`, `deleteRule`, `ruleExists`, `listRules`
+- Helper methods: `createSqlFilter`, `createCorrelationFilter`, `createSqlAction`
 
 ## Authentication
 

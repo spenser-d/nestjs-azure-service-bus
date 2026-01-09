@@ -5,11 +5,20 @@ import {
   ServiceBusReceivedMessage,
   ProcessErrorArgs,
 } from '@azure/service-bus';
-import { Server, CustomTransportStrategy } from '@nestjs/microservices';
+import {
+  Server,
+  CustomTransportStrategy,
+  WritePacket,
+  MessageHandler,
+} from '@nestjs/microservices';
 import { Logger } from '@nestjs/common';
-import { Observable, isObservable, of, lastValueFrom } from 'rxjs';
 
-import { SERVICE_BUS_TRANSPORT, SERVICE_BUS_DEFAULTS, ServiceBusServerStatus } from '../constants';
+import {
+  SERVICE_BUS_TRANSPORT,
+  SERVICE_BUS_DEFAULTS,
+  ServiceBusServerStatus,
+  NO_MESSAGE_HANDLER,
+} from '../constants';
 import type { ServiceBusServerOptions, SubscriptionConfig, IncomingPacket } from '../interfaces';
 import { ServiceBusContext } from './service-bus.context';
 import { SubscriptionManager } from './subscription-manager';
@@ -28,7 +37,7 @@ import { ServiceBusConnectionError } from '../errors';
 /**
  * Events emitted by the server
  */
-interface ServiceBusServerEvents {
+export interface ServiceBusServerEvents {
   error: (err: Error) => void;
   connected: () => void;
   disconnected: () => void;
@@ -37,6 +46,8 @@ interface ServiceBusServerEvents {
 /**
  * NestJS microservice server for Azure Service Bus
  * Supports multiple subscriptions, sessions, and dead-letter queue handling
+ *
+ * Follows NestJS microservices conventions (aligned with ServerRMQ patterns)
  */
 export class ServiceBusServer extends Server implements CustomTransportStrategy {
   public readonly transportId = SERVICE_BUS_TRANSPORT;
@@ -53,13 +64,15 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
   constructor(private readonly options: ServiceBusServerOptions) {
     super();
 
-    // Initialize serializers
+    // Initialize Service Bus specific serializers
     this.serviceBusSerializer =
-      (this.options.serializer as ServiceBusSerializer) ?? createServiceBusSerializer();
+      (this.getOptionsProp(this.options, 'serializer') as ServiceBusSerializer) ??
+      createServiceBusSerializer();
     this.serviceBusDeserializer =
-      (this.options.deserializer as ServiceBusDeserializer) ?? createServiceBusDeserializer();
+      (this.getOptionsProp(this.options, 'deserializer') as ServiceBusDeserializer) ??
+      createServiceBusDeserializer();
 
-    // Set NestJS serializers for compatibility
+    // Set NestJS base class serializers for compatibility
     this.initializeSerializer(this.options);
     this.initializeDeserializer(this.options);
   }
@@ -78,12 +91,12 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       await this.startSubscriptionManagers();
 
       this.status = ServiceBusServerStatus.CONNECTED;
-      this.emit('connected');
+      this.emitEvent('connected');
 
       callback();
     } catch (error) {
       this.status = ServiceBusServerStatus.DISCONNECTED;
-      this.emit('error', wrapError(error));
+      this.emitEvent('error', wrapError(error));
       throw error;
     }
   }
@@ -110,7 +123,7 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
     }
 
     this.status = ServiceBusServerStatus.DISCONNECTED;
-    this.emit('disconnected');
+    this.emitEvent('disconnected');
   }
 
   /**
@@ -145,9 +158,23 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
   }
 
   /**
+   * Removes an event listener
+   */
+  off<EventKey extends keyof ServiceBusServerEvents>(
+    event: EventKey,
+    callback: ServiceBusServerEvents[EventKey],
+  ): this {
+    const listeners = this.eventListeners.get(event);
+    if (listeners) {
+      listeners.delete(callback);
+    }
+    return this;
+  }
+
+  /**
    * Emits an event to registered listeners
    */
-  private emit<EventKey extends keyof ServiceBusServerEvents>(
+  private emitEvent<EventKey extends keyof ServiceBusServerEvents>(
     event: EventKey,
     ...args: Parameters<ServiceBusServerEvents[EventKey]>
   ): void {
@@ -167,17 +194,15 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
    * Creates the Azure Service Bus client
    */
   private async createClient(): Promise<void> {
-    if (this.options.connectionString) {
-      this.client = new AzureServiceBusClient(
-        this.options.connectionString,
-        this.options.clientOptions,
-      );
-    } else if (this.options.fullyQualifiedNamespace && this.options.credential) {
-      this.client = new AzureServiceBusClient(
-        this.options.fullyQualifiedNamespace,
-        this.options.credential,
-        this.options.clientOptions,
-      );
+    const connectionString = this.getOptionsProp(this.options, 'connectionString');
+    const fullyQualifiedNamespace = this.getOptionsProp(this.options, 'fullyQualifiedNamespace');
+    const credential = this.getOptionsProp(this.options, 'credential');
+    const clientOptions = this.getOptionsProp(this.options, 'clientOptions');
+
+    if (connectionString) {
+      this.client = new AzureServiceBusClient(connectionString, clientOptions);
+    } else if (fullyQualifiedNamespace && credential) {
+      this.client = new AzureServiceBusClient(fullyQualifiedNamespace, credential, clientOptions);
     } else {
       throw new ServiceBusConnectionError(
         'Either connectionString or fullyQualifiedNamespace with credential is required',
@@ -189,7 +214,8 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
    * Starts subscription managers for all configured subscriptions
    */
   private async startSubscriptionManagers(): Promise<void> {
-    const startPromises = this.options.subscriptions.map((config) =>
+    const subscriptions = this.getOptionsProp(this.options, 'subscriptions') ?? [];
+    const startPromises = subscriptions.map((config: SubscriptionConfig) =>
       this.startSubscriptionManager(config),
     );
     await Promise.all(startPromises);
@@ -206,27 +232,40 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       return;
     }
 
+    // Use getOptionsProp for all option extraction (NestJS convention)
+    const sessionEnabled =
+      this.getOptionsProp(config, 'sessionEnabled') ??
+      this.getOptionsProp(this.options, 'sessionEnabled') ??
+      false;
+    const receiveMode =
+      this.getOptionsProp(config, 'receiveMode') ??
+      this.getOptionsProp(this.options, 'receiveMode') ??
+      SERVICE_BUS_DEFAULTS.RECEIVE_MODE;
+    const maxConcurrentCalls =
+      this.getOptionsProp(config, 'maxConcurrentCalls') ??
+      this.getOptionsProp(this.options, 'maxConcurrentCalls') ??
+      SERVICE_BUS_DEFAULTS.MAX_CONCURRENT_CALLS;
+    const maxConcurrentSessions =
+      this.getOptionsProp(config, 'maxConcurrentSessions') ??
+      this.getOptionsProp(this.options, 'maxConcurrentSessions') ??
+      SERVICE_BUS_DEFAULTS.MAX_CONCURRENT_SESSIONS;
+    const sessionIdleTimeoutMs =
+      this.getOptionsProp(config, 'sessionIdleTimeoutMs') ??
+      this.getOptionsProp(this.options, 'sessionIdleTimeoutMs') ??
+      SERVICE_BUS_DEFAULTS.SESSION_IDLE_TIMEOUT_MS;
+    const handleDeadLetter = this.getOptionsProp(config, 'handleDeadLetter') ?? false;
+
     const manager = new SubscriptionManager(
       this.client!,
       {
         topic: config.topic,
         subscription: config.subscription,
-        sessionEnabled: config.sessionEnabled ?? this.options.sessionEnabled ?? false,
-        receiveMode:
-          config.receiveMode ?? this.options.receiveMode ?? SERVICE_BUS_DEFAULTS.RECEIVE_MODE,
-        maxConcurrentCalls:
-          config.maxConcurrentCalls ??
-          this.options.maxConcurrentCalls ??
-          SERVICE_BUS_DEFAULTS.MAX_CONCURRENT_CALLS,
-        maxConcurrentSessions:
-          config.maxConcurrentSessions ??
-          this.options.maxConcurrentSessions ??
-          SERVICE_BUS_DEFAULTS.MAX_CONCURRENT_SESSIONS,
-        sessionIdleTimeoutMs:
-          config.sessionIdleTimeoutMs ??
-          this.options.sessionIdleTimeoutMs ??
-          SERVICE_BUS_DEFAULTS.SESSION_IDLE_TIMEOUT_MS,
-        handleDeadLetter: config.handleDeadLetter ?? false,
+        sessionEnabled,
+        receiveMode,
+        maxConcurrentCalls,
+        maxConcurrentSessions,
+        sessionIdleTimeoutMs,
+        handleDeadLetter,
       },
       (message, receiver, isDeadLetter) =>
         this.handleMessage(message, receiver, config, isDeadLetter),
@@ -239,6 +278,7 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
 
   /**
    * Handles an incoming message
+   * Follows NestJS ServerRMQ message handling pattern
    */
   private async handleMessage(
     message: ServiceBusReceivedMessage,
@@ -273,20 +313,6 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
     const packet = this.serviceBusDeserializer.deserialize(message) as IncomingPacket;
     const pattern = packet.pattern;
 
-    // Find the handler for this pattern
-    const handler = this.getHandlerByPattern(pattern);
-
-    if (!handler) {
-      this.serverLogger.warn(`No handler found for pattern: ${pattern}`);
-      // Complete messages with no handler to prevent re-delivery
-      try {
-        await receiver.completeMessage(message);
-      } catch {
-        // Ignore
-      }
-      return;
-    }
-
     // Create context
     const ctx = new ServiceBusContext({
       message,
@@ -296,27 +322,86 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       isDeadLetter,
     });
 
-    // Determine auto-complete/dead-letter settings
+    // Check if this is an event (no correlation ID) - handle differently
+    if (!packet.id) {
+      return this.handleEventMessage(pattern, packet, ctx, receiver, config);
+    }
+
+    // Request-response pattern - find handler
+    const handler = this.getHandlerByPattern(pattern);
+
+    if (!handler) {
+      // NestJS convention: send error response to client when no handler found
+      this.serverLogger.warn(`No handler found for pattern: ${pattern}`);
+
+      // Send error response back to client (if replyTo is specified)
+      if (message.replyTo) {
+        const noHandlerPacket: WritePacket = {
+          err: NO_MESSAGE_HANDLER,
+          response: undefined,
+          isDisposed: true,
+        };
+        await this.sendMessage(noHandlerPacket, message.replyTo, packet.id);
+      }
+
+      // Complete message to prevent redelivery
+      try {
+        await receiver.completeMessage(message);
+      } catch {
+        // Ignore
+      }
+      return;
+    }
+
+    // Handle request-response
+    await this.handleRequestResponse(packet, ctx, handler, message.replyTo, receiver, config);
+  }
+
+  /**
+   * Handles event messages (fire-and-forget)
+   * Follows NestJS Server.handleEvent() convention with NACK behavior for no handler
+   */
+  private async handleEventMessage(
+    pattern: string,
+    packet: IncomingPacket,
+    ctx: ServiceBusContext,
+    receiver: ServiceBusReceiver | ServiceBusSessionReceiver,
+    config: SubscriptionConfig,
+  ): Promise<void> {
+    const handler = this.getHandlerByPattern(pattern);
+
+    // NestJS convention: if no handler for event, log warning and complete/abandon
+    if (!handler) {
+      this.serverLogger.warn(`No event handler found for pattern: ${pattern}`);
+      // Complete to prevent redelivery (unlike RMQ NACK, Service Bus doesn't have same semantics)
+      try {
+        await receiver.completeMessage(ctx.getMessage());
+      } catch {
+        // Ignore
+      }
+      return;
+    }
+
+    // Determine auto-complete settings
     const autoComplete =
-      config.autoComplete ?? this.options.autoComplete ?? SERVICE_BUS_DEFAULTS.AUTO_COMPLETE;
+      this.getOptionsProp(config, 'autoComplete') ??
+      this.getOptionsProp(this.options, 'autoComplete') ??
+      SERVICE_BUS_DEFAULTS.AUTO_COMPLETE;
     const autoDeadLetter =
-      config.autoDeadLetter ?? this.options.autoDeadLetter ?? SERVICE_BUS_DEFAULTS.AUTO_DEAD_LETTER;
+      this.getOptionsProp(config, 'autoDeadLetter') ??
+      this.getOptionsProp(this.options, 'autoDeadLetter') ??
+      SERVICE_BUS_DEFAULTS.AUTO_DEAD_LETTER;
 
     try {
-      // Check if this is an event handler (no response expected)
-      if (handler.isEventHandler) {
-        await this.handleEventMessage(pattern, packet, ctx);
-      } else {
-        // Request-response pattern
-        await this.handleRequestResponse(packet, ctx, handler, message.replyTo);
-      }
+      // Use base class handleEvent (NestJS convention)
+      await this.handleEvent(pattern, packet, ctx);
 
       // Auto-complete if enabled and not already settled
       if (autoComplete && !ctx.isSettled()) {
         await ctx.complete();
       }
     } catch (error) {
-      this.serverLogger.error(`Error handling message: ${(error as Error).message}`);
+      this.serverLogger.error(`Error handling event: ${(error as Error).message}`);
 
       // Auto dead-letter on error if enabled
       if (autoDeadLetter && !ctx.isSettled()) {
@@ -335,63 +420,99 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
   }
 
   /**
-   * Handles event messages (fire-and-forget)
-   */
-  private async handleEventMessage(
-    pattern: string,
-    packet: IncomingPacket,
-    ctx: ServiceBusContext,
-  ): Promise<void> {
-    await this.handleEvent(pattern, packet, ctx);
-  }
-
-  /**
    * Handles request-response pattern
+   * Uses base class send() method for proper streaming support (NestJS convention)
    */
   private async handleRequestResponse(
     packet: IncomingPacket,
     ctx: ServiceBusContext,
-    handler: { (data: any, ctx?: any): Promise<any> },
-    replyTo?: string,
+    handler: MessageHandler,
+    replyTo: string | undefined,
+    _receiver: ServiceBusReceiver | ServiceBusSessionReceiver,
+    config: SubscriptionConfig,
   ): Promise<void> {
-    // Get result from handler
-    const result = await handler(packet.data, ctx);
+    // Determine auto-complete settings
+    const autoComplete =
+      this.getOptionsProp(config, 'autoComplete') ??
+      this.getOptionsProp(this.options, 'autoComplete') ??
+      SERVICE_BUS_DEFAULTS.AUTO_COMPLETE;
+    const autoDeadLetter =
+      this.getOptionsProp(config, 'autoDeadLetter') ??
+      this.getOptionsProp(this.options, 'autoDeadLetter') ??
+      SERVICE_BUS_DEFAULTS.AUTO_DEAD_LETTER;
 
-    // If there's a replyTo address and a correlation ID, send response
-    if (replyTo && packet.id) {
-      const response$ = this.transformResultToObservable(result);
-      await this.sendResponse(response$, replyTo, packet.id);
+    try {
+      // Get result from handler
+      const result = await handler(packet.data, ctx);
+
+      // If there's a replyTo address and a correlation ID, send response
+      if (replyTo && packet.id) {
+        // Use base class transformToObservable (NestJS convention)
+        const response$ = this.transformToObservable(result);
+
+        // Use base class send() method with publish callback (NestJS convention)
+        // This properly handles streaming multiple values
+        const publish = async (data: WritePacket) => {
+          await this.sendMessage(data, replyTo, packet.id!);
+        };
+
+        if (response$) {
+          this.send(response$, publish);
+        }
+      }
+
+      // Auto-complete if enabled and not already settled
+      if (autoComplete && !ctx.isSettled()) {
+        await ctx.complete();
+      }
+    } catch (error) {
+      this.serverLogger.error(`Error handling message: ${(error as Error).message}`);
+
+      // Send error response to client if replyTo exists
+      if (replyTo && packet.id) {
+        const errorPacket: WritePacket = {
+          err: error,
+          response: undefined,
+          isDisposed: true,
+        };
+        try {
+          await this.sendMessage(errorPacket, replyTo, packet.id);
+        } catch (sendError) {
+          this.serverLogger.error(`Failed to send error response: ${(sendError as Error).message}`);
+        }
+      }
+
+      // Auto dead-letter on error if enabled
+      if (autoDeadLetter && !ctx.isSettled()) {
+        try {
+          await ctx.deadLetter({
+            deadLetterReason: 'HandlerError',
+            deadLetterErrorDescription: (error as Error).message,
+          });
+        } catch (dlError) {
+          this.serverLogger.error(`Failed to dead-letter message: ${(dlError as Error).message}`);
+        }
+      }
+
+      throw error;
     }
   }
 
   /**
-   * Transforms a result to an Observable
+   * Sends a message to the reply topic
+   * Follows NestJS ServerRMQ.sendMessage() pattern
    */
-  protected transformResultToObservable<T>(result: T | Promise<T> | Observable<T>): Observable<T> {
-    if (isObservable(result)) {
-      return result;
-    }
-    if (result instanceof Promise) {
-      return new Observable((subscriber) => {
-        result
-          .then((value) => {
-            subscriber.next(value);
-            subscriber.complete();
-          })
-          .catch((err) => subscriber.error(err));
-      });
-    }
-    return of(result);
-  }
-
-  /**
-   * Sends a response back to the client
-   */
-  private async sendResponse(
-    response$: Observable<any>,
+  private async sendMessage(
+    message: WritePacket,
     replyTo: string,
     correlationId: string,
   ): Promise<void> {
+    // Check if client is still connected
+    if (!this.client) {
+      this.serverLogger.warn('Cannot send message: client is not connected');
+      return;
+    }
+
     // Parse reply topic from replyTo
     // Expected format: topic/subscriptions/subscription or just topic
     const parts = replyTo.split('/subscriptions/');
@@ -402,31 +523,19 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       return;
     }
 
+    // Serialize outgoing response using base class serializer pattern
+    const outgoingResponse = this.serviceBusSerializer.serialize({
+      id: correlationId,
+      response: message.response,
+      err: message.err,
+      isDisposed: message.isDisposed,
+    });
+
     // Create sender for reply topic
-    const sender = this.client!.createSender(replyTopic);
+    const sender = this.client.createSender(replyTopic);
 
     try {
-      let lastValue: any;
-      let hasError = false;
-      let error: any;
-
-      // Collect response values
-      try {
-        lastValue = await lastValueFrom(response$);
-      } catch (err) {
-        hasError = true;
-        error = err;
-      }
-
-      // Serialize and send response
-      const responseMessage = this.serviceBusSerializer.serialize({
-        id: correlationId,
-        response: hasError ? undefined : lastValue,
-        err: hasError ? error : undefined,
-        isDisposed: true,
-      });
-
-      await sender.sendMessages(responseMessage);
+      await sender.sendMessages(outgoingResponse);
     } finally {
       await sender.close();
     }
@@ -444,7 +553,7 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       args.error.stack,
     );
 
-    this.emit(
+    this.emitEvent(
       'error',
       wrapError(args.error, {
         topic: config.topic,

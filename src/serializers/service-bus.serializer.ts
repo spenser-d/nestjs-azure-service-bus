@@ -4,6 +4,7 @@ import { MESSAGE_PROPERTIES } from '../constants';
 import { normalizePattern } from '../utils/pattern.utils';
 import { serializeError } from '../utils/error.utils';
 import type { SendMessageOptions } from '../interfaces';
+import { ServiceBusRecord, ServiceBusRecordOptions } from '../record-builders';
 
 /**
  * Outgoing message packet (request or event)
@@ -29,6 +30,8 @@ export interface OutgoingResponse {
 /**
  * Serializer for outgoing messages to Azure Service Bus
  * Converts NestJS packets to Azure Service Bus message format
+ *
+ * Follows NestJS RmqRecordSerializer pattern for ServiceBusRecord support
  */
 export class ServiceBusSerializer implements Serializer<
   OutgoingMessage | OutgoingResponse,
@@ -46,8 +49,19 @@ export class ServiceBusSerializer implements Serializer<
       return this.serializeResponse(packet);
     }
 
+    // Handle ServiceBusRecord pattern (NestJS convention like RmqRecord)
+    const outgoingPacket = packet as OutgoingMessage;
+    if (this.isRecordPacket(outgoingPacket)) {
+      const record = outgoingPacket.data as ServiceBusRecord;
+      return this.serializeRequest({
+        ...outgoingPacket,
+        data: record.data,
+        options: this.mergeOptions(outgoingPacket.options, record.options),
+      });
+    }
+
     // It's an outgoing request/event
-    return this.serializeRequest(packet as OutgoingMessage);
+    return this.serializeRequest(outgoingPacket);
   }
 
   /**
@@ -58,11 +72,16 @@ export class ServiceBusSerializer implements Serializer<
 
     const message: ServiceBusMessage = {
       body: data,
-      correlationId: id,
+      correlationId: options?.correlationId ?? id,
       contentType: options?.contentType ?? 'application/json',
       subject: options?.subject,
       sessionId: options?.sessionId ?? this.extractSessionId(data),
+      messageId: options?.messageId,
+      partitionKey: options?.partitionKey,
+      replyTo: options?.replyTo,
+      replyToSessionId: options?.replyToSessionId,
       timeToLive: options?.timeToLiveMs,
+      scheduledEnqueueTimeUtc: options?.scheduledEnqueueTimeUtc,
       applicationProperties: {
         [MESSAGE_PROPERTIES.NESTJS_MARKER]: true,
         [MESSAGE_PROPERTIES.PATTERN]: normalizePattern(pattern),
@@ -108,8 +127,38 @@ export class ServiceBusSerializer implements Serializer<
   }
 
   /**
+   * Type guard to check if packet data is a ServiceBusRecord
+   * Follows NestJS RmqRecordSerializer pattern
+   */
+  private isRecordPacket(packet: OutgoingMessage): boolean {
+    return packet?.data instanceof ServiceBusRecord;
+  }
+
+  /**
+   * Merges packet options with record options
+   * Record options take precedence (closer to the message)
+   */
+  private mergeOptions(
+    packetOptions?: SendMessageOptions,
+    recordOptions?: ServiceBusRecordOptions,
+  ): SendMessageOptions {
+    if (!recordOptions) {
+      return packetOptions ?? {};
+    }
+
+    return {
+      ...packetOptions,
+      ...recordOptions,
+      applicationProperties: {
+        ...packetOptions?.applicationProperties,
+        ...recordOptions?.applicationProperties,
+      },
+    };
+  }
+
+  /**
    * Extracts session ID from data if present
-   * Looks for __sessionId property
+   * Looks for __sessionId property (legacy support)
    */
   private extractSessionId(data: any): string | undefined {
     if (data && typeof data === 'object' && '__sessionId' in data) {

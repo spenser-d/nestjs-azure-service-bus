@@ -375,6 +375,9 @@ describe('ServiceBusServer', () => {
 
       await receiver._simulateMessage(message);
 
+      // Wait for process.nextTick (used by base class send() method)
+      await new Promise((resolve) => process.nextTick(resolve));
+
       expect(handler).toHaveBeenCalled();
       // Should have created a sender for the reply topic
       expect(mockClient.createSender).toHaveBeenCalledWith('reply-topic');
@@ -402,6 +405,9 @@ describe('ServiceBusServer', () => {
       });
 
       await receiver._simulateMessage(message);
+
+      // Wait for process.nextTick (used by base class send() method)
+      await new Promise((resolve) => process.nextTick(resolve));
 
       expect(handler).toHaveBeenCalled();
       expect(mockClient.createSender).toHaveBeenCalledWith('reply-topic');

@@ -196,6 +196,16 @@ export interface SendMessageOptions {
   sessionId?: string;
 
   /**
+   * Partition key for message grouping (transaction scenarios)
+   */
+  partitionKey?: string;
+
+  /**
+   * Custom correlation ID
+   */
+  correlationId?: string;
+
+  /**
    * Message time to live in milliseconds
    */
   timeToLiveMs?: number;
@@ -214,6 +224,26 @@ export interface SendMessageOptions {
    * Subject/label for the message
    */
   subject?: string;
+
+  /**
+   * Custom message ID
+   */
+  messageId?: string;
+
+  /**
+   * Reply-to address for request-response
+   */
+  replyTo?: string;
+
+  /**
+   * Reply-to session ID
+   */
+  replyToSessionId?: string;
+
+  /**
+   * Scheduled delivery time (UTC)
+   */
+  scheduledEnqueueTimeUtc?: Date;
 }
 
 /**
