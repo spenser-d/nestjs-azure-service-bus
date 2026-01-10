@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-01-09
+
+### Added
+
+#### Connection Resilience
+- `ConnectionManager` utility with exponential backoff reconnection
+- Circuit breaker pattern to prevent cascade failures during outages
+  - Three states: CLOSED, OPEN, HALF_OPEN
+  - Configurable failure threshold and reset timeout
+- Auto-reconnection for both client and server
+- Sender recovery when connections are restored
+- `reconnect()` method for manual reconnection triggers
+- `getCircuitState()`, `canProceed()`, `resetCircuit()` methods
+- `ServiceBusCircuitOpenError` for circuit breaker failures
+
+#### OpenTelemetry Observability
+- `ServiceBusMetricsService` for metrics collection:
+  - `service_bus_messages_published_total` counter
+  - `service_bus_messages_received_total` counter
+  - `service_bus_messages_completed_total` counter
+  - `service_bus_messages_failed_total` counter
+  - `service_bus_publish_duration_seconds` histogram
+  - `service_bus_handle_duration_seconds` histogram
+  - `service_bus_connection_status` gauge
+  - `service_bus_pending_requests` gauge
+- `ServiceBusTracingService` for distributed tracing:
+  - Span creation for publish and process operations
+  - Context propagation via message applicationProperties
+  - W3C trace context headers (traceparent, tracestate)
+- Optional dependency: only activates if `@opentelemetry/api` is installed
+
+#### Health Checks
+- `ServiceBusHealthModule` for NestJS Terminus integration
+- `ServiceBusHealthIndicator` with methods:
+  - `registerClient()`, `registerServer()` for monitoring registration
+  - `checkClient()`, `checkServer()` for individual checks
+  - `checkAllClients()`, `checkAllServers()` for bulk checks
+  - `check()` for comprehensive health status
+- Compatible with NestJS Terminus `HealthCheckService`
+- Optional dependency: only required if using health checks
+
+#### Graceful Shutdown
+- Server implements `OnApplicationShutdown` for proper lifecycle management
+- `gracefulClose()` method with configurable drain period
+- In-flight message tracking with `getInFlightCount()`
+- Client module implements `OnModuleDestroy` for auto-cleanup
+- Configurable `drainTimeoutMs` and `gracePeriodMs` options
+
+#### Configuration Options
+- `reconnect` options: enabled, maxRetries, initialDelayMs, maxDelayMs, backoffMultiplier, jitterFactor
+- `circuitBreaker` options: enabled, failureThreshold, resetTimeoutMs, halfOpenMaxAttempts
+- `observability` options: metrics, tracing (boolean or detailed config)
+- `drainTimeoutMs`, `gracePeriodMs` for shutdown behavior
+
+#### New Events
+- `reconnecting` event for client and server
+
+### Changed
+
+- Server class now implements `OnApplicationShutdown` interface
+- Client module now implements `OnModuleDestroy` interface
+- `SubscriptionManager` now includes `isHealthy()` method and health status in `getInfo()`
+- `ReplyQueueManager` now has `cancelAllPending()` and `restart()` methods
+
+### Fixed
+
+- Proper cleanup of connection manager resources on close
+
 ## [0.2.0] - 2026-01-08
 
 ### Added

@@ -64,6 +64,45 @@ export const SERVICE_BUS_DEFAULTS = {
     MAX_RETRY_DELAY_MS: 120000,
     MODE: 'exponential' as const,
   },
+
+  /**
+   * Reconnection options
+   */
+  RECONNECT: {
+    ENABLED: true,
+    MAX_RETRIES: Infinity,
+    INITIAL_DELAY_MS: 1000,
+    MAX_DELAY_MS: 30000,
+    BACKOFF_MULTIPLIER: 2,
+    JITTER_FACTOR: 0.1,
+  },
+
+  /**
+   * Circuit breaker options
+   */
+  CIRCUIT_BREAKER: {
+    ENABLED: true,
+    FAILURE_THRESHOLD: 5,
+    RESET_TIMEOUT_MS: 30000,
+    HALF_OPEN_MAX_ATTEMPTS: 3,
+  },
+
+  /**
+   * Graceful shutdown options
+   */
+  SHUTDOWN: {
+    DRAIN_TIMEOUT_MS: 30000,
+    GRACE_PERIOD_MS: 5000,
+  },
+
+  /**
+   * Observability options
+   */
+  OBSERVABILITY: {
+    METER_NAME: 'nestjs-azure-service-bus',
+    TRACER_NAME: 'nestjs-azure-service-bus',
+    METRICS_PREFIX: 'service_bus',
+  },
 } as const;
 
 /**

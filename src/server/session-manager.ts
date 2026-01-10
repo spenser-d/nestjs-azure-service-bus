@@ -190,8 +190,8 @@ export class SessionManager {
         if (!receiver.isClosed) {
           await receiver.close();
         }
-      } catch {
-        // Ignore close errors
+      } catch (err) {
+        this.logger.debug(`Error closing session receiver: ${(err as Error).message}`);
       }
 
       this.logger.debug(`Session ${sessionId} closed`);

@@ -24,6 +24,9 @@ export enum ServiceBusTransportErrorCode {
   QUOTA_EXCEEDED = 'QUOTA_EXCEEDED',
   ENTITY_NOT_FOUND = 'ENTITY_NOT_FOUND',
 
+  // Circuit breaker
+  CIRCUIT_OPEN = 'CIRCUIT_OPEN',
+
   // General
   UNKNOWN = 'UNKNOWN',
 }

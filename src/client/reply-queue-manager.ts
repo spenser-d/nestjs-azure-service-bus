@@ -4,7 +4,7 @@ import type {
   ServiceBusReceivedMessage,
 } from '@azure/service-bus';
 import { Logger } from '@nestjs/common';
-import { ServiceBusDeserializer } from '../serializers/service-bus.deserializer';
+import type { Deserializer } from '@nestjs/microservices';
 import type { ResponsePacket } from '../interfaces';
 import { ServiceBusTimeoutError } from '../errors';
 
@@ -31,6 +31,11 @@ export interface ReplyQueueManagerOptions {
    * Request timeout in milliseconds
    */
   requestTimeout: number;
+
+  /**
+   * Optional deserializer for response messages
+   */
+  deserializer?: Deserializer;
 }
 
 /**
@@ -39,7 +44,6 @@ export interface ReplyQueueManagerOptions {
 interface PendingRequest {
   callback: ResponseCallback;
   timer: NodeJS.Timeout;
-  resolve: () => void;
 }
 
 /**
@@ -50,15 +54,25 @@ export class ReplyQueueManager {
   private readonly logger = new Logger(ReplyQueueManager.name);
   private readonly pendingRequests = new Map<string, PendingRequest>();
 
+  private client: ServiceBusClient;
   private receiver: ServiceBusReceiver | null = null;
   private subscription: { close: () => Promise<void> } | null = null;
-  private deserializer: ServiceBusDeserializer;
+  private readonly deserializer: Deserializer;
 
   constructor(
-    private readonly client: ServiceBusClient,
+    client: ServiceBusClient,
     private readonly options: ReplyQueueManagerOptions,
   ) {
-    this.deserializer = new ServiceBusDeserializer();
+    this.client = client;
+    // Use provided deserializer or create a default one
+    if (options.deserializer) {
+      this.deserializer = options.deserializer;
+    } else {
+      // Lazy import to avoid circular dependency
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+      const { ServiceBusDeserializer } = require('../serializers/service-bus.deserializer');
+      this.deserializer = new ServiceBusDeserializer();
+    }
   }
 
   /**
@@ -105,7 +119,6 @@ export class ReplyQueueManager {
         err: new Error('Reply queue stopped'),
         isDisposed: true,
       });
-      pending.resolve();
     }
     this.pendingRequests.clear();
 
@@ -142,6 +155,11 @@ export class ReplyQueueManager {
   ): () => void {
     const requestTimeout = timeout ?? this.options.requestTimeout;
 
+    // Validate timeout
+    if (requestTimeout <= 0) {
+      throw new Error('Request timeout must be greater than 0');
+    }
+
     // Create timeout handler
     const timer = setTimeout(() => {
       const pending = this.pendingRequests.get(correlationId);
@@ -155,20 +173,12 @@ export class ReplyQueueManager {
           }),
           isDisposed: true,
         });
-        pending.resolve();
       }
     }, requestTimeout);
-
-    // Store pending request
-    let resolvePromise: () => void = () => {};
-    new Promise<void>((resolve) => {
-      resolvePromise = resolve;
-    });
 
     this.pendingRequests.set(correlationId, {
       callback,
       timer,
-      resolve: resolvePromise,
     });
 
     // Return cleanup function
@@ -177,7 +187,6 @@ export class ReplyQueueManager {
       if (pending) {
         clearTimeout(pending.timer);
         this.pendingRequests.delete(correlationId);
-        pending.resolve();
       }
     };
   }
@@ -194,6 +203,61 @@ export class ReplyQueueManager {
    */
   getPendingRequestCount(): number {
     return this.pendingRequests.size;
+  }
+
+  /**
+   * Cancels all pending requests with a specific reason
+   * Used during graceful shutdown or unrecoverable errors
+   *
+   * @param reason - The reason for cancellation
+   */
+  async cancelAllPending(reason: string): Promise<void> {
+    const count = this.pendingRequests.size;
+    const error = new Error(reason);
+
+    for (const [correlationId, pending] of this.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.callback({
+        id: correlationId,
+        err: error,
+        isDisposed: true,
+      });
+    }
+    this.pendingRequests.clear();
+
+    if (count > 0) {
+      this.logger.log(`Cancelled ${count} pending requests: ${reason}`);
+    }
+  }
+
+  /**
+   * Restarts the reply queue manager with a new client
+   * Preserves pending requests across the restart
+   *
+   * @param client - New Service Bus client
+   */
+  async restart(client: ServiceBusClient): Promise<void> {
+    // Close existing subscription and receiver
+    if (this.subscription) {
+      await this.subscription.close().catch((err) => {
+        this.logger.debug(`Error closing subscription during restart: ${err.message}`);
+      });
+      this.subscription = null;
+    }
+
+    if (this.receiver) {
+      await this.receiver.close().catch((err) => {
+        this.logger.debug(`Error closing receiver during restart: ${err.message}`);
+      });
+      this.receiver = null;
+    }
+
+    // Update client reference
+    this.client = client;
+
+    // Start listening again
+    await this.start();
+    this.logger.log('Reply queue manager restarted');
   }
 
   /**
@@ -230,7 +294,5 @@ export class ReplyQueueManager {
         isDisposed: true,
       });
     }
-
-    pending.resolve();
   }
 }

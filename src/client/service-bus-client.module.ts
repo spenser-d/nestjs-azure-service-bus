@@ -1,4 +1,5 @@
-import { DynamicModule, Module, Provider } from '@nestjs/common';
+import { DynamicModule, Module, Provider, OnModuleDestroy, Inject, Logger } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { ServiceBusClientProxy } from './service-bus.client';
 import type {
   ServiceBusClientModuleOptions,
@@ -6,7 +7,14 @@ import type {
 } from '../interfaces';
 
 /**
+ * Token for tracking registered client names
+ */
+const SERVICE_BUS_CLIENT_NAMES = Symbol('SERVICE_BUS_CLIENT_NAMES');
+
+/**
  * Module for registering Azure Service Bus clients
+ *
+ * Automatically closes all registered clients when the module is destroyed.
  *
  * @example
  * ```typescript
@@ -33,17 +41,55 @@ import type {
  * ```
  */
 @Module({})
-export class ServiceBusClientModule {
+export class ServiceBusClientModule implements OnModuleDestroy {
+  private readonly logger = new Logger(ServiceBusClientModule.name);
+
+  constructor(
+    private readonly moduleRef: ModuleRef,
+    @Inject(SERVICE_BUS_CLIENT_NAMES)
+    private readonly clientNames: (string | symbol)[],
+  ) {}
+
+  /**
+   * Called when the module is being destroyed
+   * Gracefully closes all registered clients
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.logger.log('Closing Service Bus clients...');
+
+    const closePromises = this.clientNames.map(async (name) => {
+      try {
+        const client = this.moduleRef.get<ServiceBusClientProxy>(name, { strict: false });
+        if (client && typeof client.gracefulClose === 'function') {
+          await client.gracefulClose();
+          this.logger.debug(`Closed client '${String(name)}'`);
+        }
+      } catch (error) {
+        this.logger.warn(`Error closing client '${String(name)}': ${(error as Error).message}`);
+      }
+    });
+
+    await Promise.all(closePromises);
+    this.logger.log('All Service Bus clients closed');
+  }
+
   /**
    * Registers one or more Service Bus clients synchronously
    */
   static register(options: ServiceBusClientModuleOptions[]): DynamicModule {
     const providers = options.map((opt) => this.createClientProvider(opt));
     const exports = options.map((opt) => opt.name);
+    const clientNames = options.map((opt) => opt.name);
 
     return {
       module: ServiceBusClientModule,
-      providers,
+      providers: [
+        ...providers,
+        {
+          provide: SERVICE_BUS_CLIENT_NAMES,
+          useValue: clientNames,
+        },
+      ],
       exports,
     };
   }
@@ -55,11 +101,18 @@ export class ServiceBusClientModule {
     const providers = options.map((opt) => this.createAsyncClientProvider(opt));
     const imports = options.flatMap((opt) => opt.imports ?? []);
     const exports = options.map((opt) => opt.name);
+    const clientNames = options.map((opt) => opt.name);
 
     return {
       module: ServiceBusClientModule,
       imports,
-      providers,
+      providers: [
+        ...providers,
+        {
+          provide: SERVICE_BUS_CLIENT_NAMES,
+          useValue: clientNames,
+        },
+      ],
       exports,
     };
   }

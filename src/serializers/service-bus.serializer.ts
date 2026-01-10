@@ -68,14 +68,24 @@ export class ServiceBusSerializer implements Serializer<
    * Serializes an outgoing request or event
    */
   private serializeRequest(packet: OutgoingMessage): ServiceBusMessage {
-    const { pattern, data, id, options } = packet;
+    const { pattern, id, options } = packet;
+    let { data } = packet;
+
+    // Extract session ID from data without mutating the original
+    const extractedSessionId = this.extractSessionId(data);
+    if (extractedSessionId !== undefined && data && typeof data === 'object') {
+      // Create a shallow copy without __sessionId
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { __sessionId: _sessionId, ...cleanData } = data;
+      data = cleanData;
+    }
 
     const message: ServiceBusMessage = {
       body: data,
       correlationId: options?.correlationId ?? id,
       contentType: options?.contentType ?? 'application/json',
       subject: options?.subject,
-      sessionId: options?.sessionId ?? this.extractSessionId(data),
+      sessionId: options?.sessionId ?? extractedSessionId,
       messageId: options?.messageId,
       partitionKey: options?.partitionKey,
       replyTo: options?.replyTo,
@@ -159,13 +169,12 @@ export class ServiceBusSerializer implements Serializer<
   /**
    * Extracts session ID from data if present
    * Looks for __sessionId property (legacy support)
+   * Does NOT mutate the original data
    */
-  private extractSessionId(data: any): string | undefined {
+  private extractSessionId(data: unknown): string | undefined {
     if (data && typeof data === 'object' && '__sessionId' in data) {
-      const sessionId = data.__sessionId;
-      // Remove the internal property from data
-      delete data.__sessionId;
-      return sessionId;
+      const sessionId = (data as Record<string, unknown>).__sessionId;
+      return typeof sessionId === 'string' ? sessionId : undefined;
     }
     return undefined;
   }

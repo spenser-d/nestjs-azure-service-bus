@@ -8,6 +8,14 @@ module.exports = {
   },
   collectCoverageFrom: ['src/**/*.(t|j)s', '!src/**/index.ts'],
   coverageDirectory: './coverage',
+  coverageThreshold: {
+    global: {
+      branches: 70,
+      functions: 80,
+      lines: 80,
+      statements: 80,
+    },
+  },
   testEnvironment: 'node',
   roots: ['<rootDir>/src/', '<rootDir>/test/'],
   moduleNameMapper: {

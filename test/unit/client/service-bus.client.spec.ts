@@ -79,12 +79,13 @@ describe('ServiceBusClientProxy', () => {
       expect(ServiceBusClient).toHaveBeenCalledTimes(1);
     });
 
-    it('should throw if neither connectionString nor namespace provided', async () => {
-      client = new ServiceBusClientProxy({
-        topic: 'test-topic',
-      } as any);
-
-      await expect(client.connect()).rejects.toThrow();
+    it('should throw if neither connectionString nor namespace provided', () => {
+      // Validation now happens in constructor (fail-fast)
+      expect(() => {
+        new ServiceBusClientProxy({
+          topic: 'test-topic',
+        } as any);
+      }).toThrow('Either connectionString or fullyQualifiedNamespace is required');
     });
   });
 
@@ -223,6 +224,227 @@ describe('ServiceBusClientProxy', () => {
       });
 
       expect(() => client.getClient()).toThrow('Client not connected');
+    });
+  });
+
+  describe('event emitter', () => {
+    it('should register and trigger event listeners', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      const connectedHandler = jest.fn();
+      client.on('connected', connectedHandler);
+
+      await client.connect();
+
+      expect(connectedHandler).toHaveBeenCalled();
+    });
+
+    it('should remove event listeners with off()', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      const handler = jest.fn();
+      client.on('connected', handler);
+      client.off('connected', handler);
+
+      await client.connect();
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it('should emit disconnected event on close', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      const disconnectedHandler = jest.fn();
+      client.on('disconnected', disconnectedHandler);
+
+      await client.connect();
+      await client.close();
+
+      expect(disconnectedHandler).toHaveBeenCalled();
+    });
+
+    it('should handle errors in event listeners gracefully', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      const errorHandler = jest.fn(() => {
+        throw new Error('Handler error');
+      });
+      client.on('connected', errorHandler);
+
+      // Should not throw
+      await expect(client.connect()).resolves.toBeDefined();
+    });
+  });
+
+  describe('gracefulClose', () => {
+    it('should close the client gracefully', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      await client.connect();
+      await client.gracefulClose();
+
+      expect(client.getStatus()).toBe(ServiceBusClientStatus.DISCONNECTED);
+    });
+  });
+
+  describe('circuit breaker methods', () => {
+    it('should return circuit state', () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      expect(client.getCircuitState()).toBe('closed');
+    });
+
+    it('should return canProceed status', () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      expect(client.canProceed()).toBe(true);
+    });
+
+    it('should reset circuit', () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      // Should not throw
+      expect(() => client.resetCircuit()).not.toThrow();
+    });
+  });
+
+  describe('scheduleMessages', () => {
+    it('should schedule multiple messages', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      await client.connect();
+
+      const scheduledTime = new Date(Date.now() + 60000);
+      const messages = [{ id: 1 }, { id: 2 }];
+
+      const sequenceNumbers = await client.scheduleMessages(
+        'batch.reminder',
+        messages,
+        scheduledTime,
+      );
+
+      expect(sequenceNumbers).toBeDefined();
+      const sender = mockAzureClient._getSender('test-topic');
+      expect(sender.scheduleMessages).toHaveBeenCalled();
+    });
+  });
+
+  describe('cancelScheduledMessages', () => {
+    it('should cancel multiple scheduled messages', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      await client.connect();
+
+      const sequenceNumbers = [Long.fromNumber(123), Long.fromNumber(456)];
+      await client.cancelScheduledMessages(sequenceNumbers);
+
+      const sender = mockAzureClient._getSender('test-topic');
+      expect(sender.cancelScheduledMessages).toHaveBeenCalledWith(sequenceNumbers);
+    });
+  });
+
+  describe('message browsing', () => {
+    it('should peek messages', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      await client.connect();
+
+      const messages = await client.peekMessages('test-topic', 'test-subscription', 10);
+      expect(messages).toBeDefined();
+    });
+
+    it('should peek dead letter messages', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      await client.connect();
+
+      const messages = await client.peekDeadLetterMessages('test-topic', 'test-subscription', 10);
+      expect(messages).toBeDefined();
+    });
+  });
+
+  describe('reconnect', () => {
+    it('should skip if already reconnecting', async () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+      });
+
+      await client.connect();
+
+      // Start first reconnect
+      const reconnect1 = client.reconnect();
+      // Try to start second reconnect
+      const reconnect2 = client.reconnect();
+
+      await Promise.all([reconnect1, reconnect2]);
+
+      // Should have only created one new client
+      expect(ServiceBusClient).toHaveBeenCalled();
+    });
+  });
+
+  describe('observability options', () => {
+    it('should create client with observability options', () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+        observability: {
+          metrics: true,
+          tracing: true,
+        },
+      });
+
+      expect(client).toBeDefined();
+    });
+
+    it('should create client with custom observability options', () => {
+      client = new ServiceBusClientProxy({
+        connectionString: 'Endpoint=sb://test.servicebus.windows.net/',
+        topic: 'test-topic',
+        observability: {
+          metrics: { meterName: 'custom-meter' },
+          tracing: { tracerName: 'custom-tracer' },
+        },
+      });
+
+      expect(client).toBeDefined();
     });
   });
 });

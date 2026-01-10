@@ -43,6 +43,7 @@ export type ErrorHandler = (args: ProcessErrorArgs) => Promise<void>;
 export class SubscriptionManager {
   private readonly logger = new Logger(SubscriptionManager.name);
 
+  private client: ServiceBusClient;
   private receiver: ServiceBusReceiver | null = null;
   private dlqReceiver: ServiceBusReceiver | null = null;
   private sessionManager: SessionManager | null = null;
@@ -50,11 +51,13 @@ export class SubscriptionManager {
   private dlqSubscription: { close: () => Promise<void> } | null = null;
 
   constructor(
-    private readonly client: ServiceBusClient,
+    client: ServiceBusClient,
     private readonly options: SubscriptionManagerOptions,
     private readonly messageHandler: MessageHandler,
     private readonly errorHandler: ErrorHandler,
-  ) {}
+  ) {
+    this.client = client;
+  }
 
   /**
    * Gets the unique key for this subscription
@@ -202,6 +205,37 @@ export class SubscriptionManager {
   }
 
   /**
+   * Restarts the subscription manager with a new client
+   * Used for recovery after connection loss
+   *
+   * @param client - New Service Bus client
+   */
+  async restart(client: ServiceBusClient): Promise<void> {
+    this.logger.log(`Restarting subscription manager for ${this.getKey()}`);
+
+    // Stop existing receivers
+    await this.stop();
+
+    // Update client reference
+    this.client = client;
+
+    // Start again
+    await this.start();
+
+    this.logger.log(`Subscription manager restarted for ${this.getKey()}`);
+  }
+
+  /**
+   * Checks if the subscription manager is healthy
+   */
+  isHealthy(): boolean {
+    if (this.options.sessionEnabled) {
+      return this.sessionManager !== null;
+    }
+    return this.receiver !== null && !this.receiver.isClosed;
+  }
+
+  /**
    * Gets info about the subscription manager
    */
   getInfo(): {
@@ -210,6 +244,7 @@ export class SubscriptionManager {
     sessionEnabled: boolean;
     activeSessionCount?: number;
     handleDeadLetter: boolean;
+    healthy: boolean;
   } {
     return {
       topic: this.options.topic,
@@ -217,6 +252,7 @@ export class SubscriptionManager {
       sessionEnabled: this.options.sessionEnabled,
       activeSessionCount: this.sessionManager?.getActiveSessionCount(),
       handleDeadLetter: this.options.handleDeadLetter,
+      healthy: this.isHealthy(),
     };
   }
 }
