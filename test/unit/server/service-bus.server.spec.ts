@@ -113,12 +113,13 @@ describe('ServiceBusServer', () => {
       expect(connectedHandler).toHaveBeenCalled();
     });
 
-    it('should throw if neither connectionString nor namespace provided', async () => {
-      server = new ServiceBusServer({
-        subscriptions: [{ topic: 'test-topic', subscription: 'test-sub' }],
-      } as any);
-
-      await expect(server.listen(jest.fn())).rejects.toThrow();
+    it('should throw if neither connectionString nor namespace provided', () => {
+      // Validation now happens in constructor (fail-fast)
+      expect(() => {
+        new ServiceBusServer({
+          subscriptions: [{ topic: 'test-topic', subscription: 'test-sub' }],
+        } as any);
+      }).toThrow('Either connectionString or fullyQualifiedNamespace is required');
     });
   });
 

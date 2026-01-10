@@ -11,7 +11,7 @@ import {
   WritePacket,
   MessageHandler,
 } from '@nestjs/microservices';
-import { Logger } from '@nestjs/common';
+import { Logger, OnApplicationShutdown } from '@nestjs/common';
 
 import {
   SERVICE_BUS_TRANSPORT,
@@ -32,7 +32,11 @@ import {
 } from '../serializers/service-bus.deserializer';
 import { wrapError } from '../utils/error.utils';
 import { createSubscriptionKey } from '../utils/pattern.utils';
+import { ConnectionManager, CircuitState } from '../utils/connection-manager';
 import { ServiceBusConnectionError } from '../errors';
+import { ServiceBusMetricsService } from '../observability/metrics.service';
+import { ServiceBusTracingService } from '../observability/tracing.service';
+import { validateServerOptions } from '../utils/validation.utils';
 
 /**
  * Events emitted by the server
@@ -41,6 +45,7 @@ export interface ServiceBusServerEvents {
   error: (err: Error) => void;
   connected: () => void;
   disconnected: () => void;
+  reconnecting: () => void;
 }
 
 /**
@@ -49,7 +54,10 @@ export interface ServiceBusServerEvents {
  *
  * Follows NestJS microservices conventions (aligned with ServerRMQ patterns)
  */
-export class ServiceBusServer extends Server implements CustomTransportStrategy {
+export class ServiceBusServer
+  extends Server
+  implements CustomTransportStrategy, OnApplicationShutdown
+{
   public readonly transportId = SERVICE_BUS_TRANSPORT;
 
   protected readonly serviceBusSerializer: ServiceBusSerializer;
@@ -60,9 +68,38 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
   private readonly subscriptionManagers = new Map<string, SubscriptionManager>();
   private readonly eventListeners = new Map<string, Set<(...args: any[]) => void>>();
   private readonly serverLogger = new Logger(ServiceBusServer.name);
+  private readonly connectionManager: ConnectionManager;
+  private readonly metricsService: ServiceBusMetricsService | null = null;
+  private readonly tracingService: ServiceBusTracingService | null = null;
+  private inFlightCount = 0;
+  private isShuttingDown = false;
 
   constructor(private readonly options: ServiceBusServerOptions) {
     super();
+
+    // Validate options early to fail fast with helpful error messages
+    validateServerOptions(options);
+
+    // Initialize connection manager for resilience
+    this.connectionManager = new ConnectionManager({
+      name: 'ServiceBusServer',
+      reconnect: this.options.reconnect,
+      circuitBreaker: this.options.circuitBreaker,
+    });
+
+    // Forward connection manager events
+    this.setupConnectionManagerEvents();
+
+    // Initialize observability services if configured
+    const observability = this.getOptionsProp(this.options, 'observability');
+    if (observability) {
+      if (observability.metrics) {
+        this.metricsService = new ServiceBusMetricsService(observability.metrics);
+      }
+      if (observability.tracing) {
+        this.tracingService = new ServiceBusTracingService(observability.tracing);
+      }
+    }
 
     // Initialize Service Bus specific serializers
     this.serviceBusSerializer =
@@ -75,6 +112,38 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
     // Set NestJS base class serializers for compatibility
     this.initializeSerializer(this.options);
     this.initializeDeserializer(this.options);
+  }
+
+  /**
+   * Sets up event forwarding from connection manager
+   */
+  private setupConnectionManagerEvents(): void {
+    this.connectionManager.on('reconnect:start', () => {
+      this.status = ServiceBusServerStatus.RECONNECTING;
+      this.emitEvent('reconnecting');
+    });
+
+    this.connectionManager.on('reconnect:success', () => {
+      this.status = ServiceBusServerStatus.CONNECTED;
+      this.emitEvent('connected');
+    });
+
+    this.connectionManager.on('reconnect:failed', (error) => {
+      this.emitEvent('error', error);
+    });
+
+    this.connectionManager.on('reconnect:exhausted', () => {
+      this.status = ServiceBusServerStatus.DISCONNECTED;
+      this.emitEvent('disconnected');
+    });
+
+    this.connectionManager.on('circuit:open', () => {
+      this.serverLogger.warn('Circuit breaker opened - message processing may be affected');
+    });
+
+    this.connectionManager.on('circuit:close', () => {
+      this.serverLogger.log('Circuit breaker closed - normal operation resumed');
+    });
   }
 
   /**
@@ -91,6 +160,7 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       await this.startSubscriptionManagers();
 
       this.status = ServiceBusServerStatus.CONNECTED;
+      this.metricsService?.updateConnectionStatus(true);
       this.emitEvent('connected');
 
       callback();
@@ -107,6 +177,9 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
   async close(): Promise<void> {
     this.status = ServiceBusServerStatus.CLOSING;
 
+    // Cancel any ongoing reconnection
+    this.connectionManager.cancelReconnect();
+
     // Stop all subscription managers
     const stopPromises = Array.from(this.subscriptionManagers.values()).map((manager) =>
       manager.stop().catch((err) => {
@@ -122,8 +195,153 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       this.client = null;
     }
 
+    // Cleanup connection manager
+    this.connectionManager.destroy();
+
     this.status = ServiceBusServerStatus.DISCONNECTED;
+    this.metricsService?.updateConnectionStatus(false);
     this.emitEvent('disconnected');
+
+    // Clear event listeners AFTER emitting disconnected to prevent memory leaks
+    this.eventListeners.clear();
+  }
+
+  /**
+   * Called by NestJS when the application is shutting down
+   * Implements OnApplicationShutdown for proper lifecycle management
+   */
+  async onApplicationShutdown(signal?: string): Promise<void> {
+    this.serverLogger.log(`Received shutdown signal: ${signal || 'unknown'}`);
+    await this.gracefulClose();
+  }
+
+  /**
+   * Gracefully closes the server with drain period
+   * 1. Stops accepting new messages
+   * 2. Waits for in-flight messages to complete
+   * 3. Closes all resources
+   */
+  async gracefulClose(): Promise<void> {
+    if (this.isShuttingDown) {
+      return;
+    }
+
+    this.isShuttingDown = true;
+    this.serverLogger.log('Starting graceful shutdown...');
+
+    const drainTimeout =
+      this.getOptionsProp(this.options, 'drainTimeoutMs') ??
+      SERVICE_BUS_DEFAULTS.SHUTDOWN.DRAIN_TIMEOUT_MS;
+    const gracePeriod =
+      this.getOptionsProp(this.options, 'gracePeriodMs') ??
+      SERVICE_BUS_DEFAULTS.SHUTDOWN.GRACE_PERIOD_MS;
+
+    // Step 1: Stop all subscription managers to prevent new messages
+    // This must happen FIRST to prevent an indefinite shutdown
+    this.serverLogger.log('Stopping subscription managers...');
+    const stopPromises = Array.from(this.subscriptionManagers.values()).map((manager) =>
+      manager.stop().catch((err) => {
+        this.serverLogger.warn(
+          `Error stopping subscription manager during shutdown: ${err.message}`,
+        );
+      }),
+    );
+    await Promise.all(stopPromises);
+    this.subscriptionManagers.clear();
+    this.serverLogger.log('Subscription managers stopped');
+
+    // Step 2: Wait for in-flight messages to complete (with timeout)
+    if (this.inFlightCount > 0) {
+      this.serverLogger.log(`Waiting for ${this.inFlightCount} in-flight messages to complete...`);
+
+      const drainStart = Date.now();
+      while (this.inFlightCount > 0 && Date.now() - drainStart < drainTimeout) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      if (this.inFlightCount > 0) {
+        this.serverLogger.warn(
+          `Drain timeout reached with ${this.inFlightCount} messages still in-flight`,
+        );
+      } else {
+        this.serverLogger.log('All in-flight messages completed');
+      }
+    }
+
+    // Step 3: Grace period before final cleanup
+    if (gracePeriod > 0) {
+      this.serverLogger.log(`Waiting ${gracePeriod}ms grace period...`);
+      await new Promise((resolve) => setTimeout(resolve, gracePeriod));
+    }
+
+    // Step 4: Close remaining resources (client, connection manager)
+    // Note: Subscription managers already stopped above, so close() will skip them
+    await this.closeResources();
+    this.serverLogger.log('Graceful shutdown complete');
+  }
+
+  /**
+   * Closes remaining resources after subscriptions are stopped
+   * Used by gracefulClose to avoid re-stopping subscriptions
+   */
+  private async closeResources(): Promise<void> {
+    this.status = ServiceBusServerStatus.CLOSING;
+
+    // Cancel any ongoing reconnection
+    this.connectionManager.cancelReconnect();
+
+    // Close the client
+    if (this.client) {
+      await this.client.close();
+      this.client = null;
+    }
+
+    // Cleanup connection manager
+    this.connectionManager.destroy();
+
+    this.status = ServiceBusServerStatus.DISCONNECTED;
+    this.metricsService?.updateConnectionStatus(false);
+    this.emitEvent('disconnected');
+
+    // Clear event listeners AFTER emitting disconnected to prevent memory leaks
+    this.eventListeners.clear();
+  }
+
+  /**
+   * Increments the in-flight message count
+   * Called when starting to process a message
+   */
+  private startProcessing(): void {
+    this.inFlightCount++;
+  }
+
+  /**
+   * Decrements the in-flight message count
+   * Called when finished processing a message
+   */
+  private endProcessing(): void {
+    this.inFlightCount = Math.max(0, this.inFlightCount - 1);
+  }
+
+  /**
+   * Gets the current in-flight message count
+   */
+  getInFlightCount(): number {
+    return this.inFlightCount;
+  }
+
+  /**
+   * Gets the current circuit breaker state
+   */
+  getCircuitState(): CircuitState {
+    return this.connectionManager.getCircuitState();
+  }
+
+  /**
+   * Manually resets the circuit breaker
+   */
+  resetCircuit(): void {
+    this.connectionManager.resetCircuit();
   }
 
   /**
@@ -286,14 +504,45 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
     config: SubscriptionConfig,
     isDeadLetter: boolean,
   ): Promise<void> {
+    // Skip processing if shutting down
+    if (this.isShuttingDown) {
+      this.serverLogger.debug('Skipping message processing during shutdown');
+      return;
+    }
+
+    // Track in-flight messages for graceful shutdown
+    this.startProcessing();
+
+    try {
+      await this.processMessage(message, receiver, config, isDeadLetter);
+      // Record success for circuit breaker
+      this.connectionManager.recordSuccess();
+    } catch (error) {
+      // Record failure for circuit breaker
+      this.connectionManager.recordFailure(error as Error);
+      throw error;
+    } finally {
+      this.endProcessing();
+    }
+  }
+
+  /**
+   * Internal message processing logic
+   */
+  private async processMessage(
+    message: ServiceBusReceivedMessage,
+    receiver: ServiceBusReceiver | ServiceBusSessionReceiver,
+    config: SubscriptionConfig,
+    isDeadLetter: boolean,
+  ): Promise<void> {
     // Check if it's a NestJS message
     if (!this.serviceBusDeserializer.isNestJsMessage(message)) {
       this.serverLogger.warn('Received non-NestJS message, skipping');
       // Complete non-NestJS messages to prevent re-delivery
       try {
         await receiver.completeMessage(message);
-      } catch {
-        // Ignore settlement errors for non-NestJS messages
+      } catch (err) {
+        this.serverLogger.debug(`Failed to complete non-NestJS message: ${(err as Error).message}`);
       }
       return;
     }
@@ -303,8 +552,8 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       this.serverLogger.warn('Received response message on server, skipping');
       try {
         await receiver.completeMessage(message);
-      } catch {
-        // Ignore
+      } catch (err) {
+        this.serverLogger.debug(`Failed to complete response message: ${(err as Error).message}`);
       }
       return;
     }
@@ -312,8 +561,23 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
     // Deserialize the message
     const packet = this.serviceBusDeserializer.deserialize(message) as IncomingPacket;
     const pattern = packet.pattern;
+    const patternStr = typeof pattern === 'string' ? pattern : JSON.stringify(pattern);
 
-    // Create context
+    // Record message received
+    this.metricsService?.recordMessageReceived(config.topic, config.subscription, patternStr);
+
+    // Extract trace context and start processing span
+    const parentContext = this.tracingService?.extractContext(message);
+    const span =
+      this.tracingService?.startProcessSpan(
+        patternStr,
+        config.topic,
+        config.subscription,
+        parentContext,
+      ) ?? null;
+    const startTime = Date.now();
+
+    // Create context with observability hooks
     const ctx = new ServiceBusContext({
       message,
       receiver,
@@ -322,39 +586,67 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       isDeadLetter,
     });
 
-    // Check if this is an event (no correlation ID) - handle differently
-    if (!packet.id) {
-      return this.handleEventMessage(pattern, packet, ctx, receiver, config);
-    }
+    try {
+      // Check if this is an event (no correlation ID) - handle differently
+      if (!packet.id) {
+        await this.handleEventMessage(pattern, packet, ctx, receiver, config);
+      } else {
+        // Request-response pattern - find handler
+        const handler = this.getHandlerByPattern(pattern);
 
-    // Request-response pattern - find handler
-    const handler = this.getHandlerByPattern(pattern);
+        if (!handler) {
+          // NestJS convention: send error response to client when no handler found
+          this.serverLogger.warn(`No handler found for pattern: ${pattern}`);
 
-    if (!handler) {
-      // NestJS convention: send error response to client when no handler found
-      this.serverLogger.warn(`No handler found for pattern: ${pattern}`);
+          // Send error response back to client (if replyTo is specified)
+          if (message.replyTo) {
+            const noHandlerPacket: WritePacket = {
+              err: NO_MESSAGE_HANDLER,
+              response: undefined,
+              isDisposed: true,
+            };
+            await this.sendMessage(noHandlerPacket, message.replyTo, packet.id);
+          }
 
-      // Send error response back to client (if replyTo is specified)
-      if (message.replyTo) {
-        const noHandlerPacket: WritePacket = {
-          err: NO_MESSAGE_HANDLER,
-          response: undefined,
-          isDisposed: true,
-        };
-        await this.sendMessage(noHandlerPacket, message.replyTo, packet.id);
+          // Complete message to prevent redelivery
+          try {
+            await receiver.completeMessage(message);
+          } catch (err) {
+            this.serverLogger.debug(
+              `Failed to complete no-handler message: ${(err as Error).message}`,
+            );
+          }
+        } else {
+          // Handle request-response
+          await this.handleRequestResponse(packet, ctx, handler, message.replyTo, receiver, config);
+        }
       }
 
-      // Complete message to prevent redelivery
-      try {
-        await receiver.completeMessage(message);
-      } catch {
-        // Ignore
+      // Record success metrics
+      this.metricsService?.recordHandleLatency(
+        Date.now() - startTime,
+        config.topic,
+        config.subscription,
+      );
+      if (ctx.isSettled()) {
+        this.metricsService?.recordMessageCompleted(config.topic, config.subscription);
       }
-      return;
+      this.tracingService?.endSpan(span);
+    } catch (error) {
+      // Record failure metrics
+      this.metricsService?.recordMessageFailed(
+        config.topic,
+        config.subscription,
+        (error as Error).name,
+      );
+      this.metricsService?.recordHandleLatency(
+        Date.now() - startTime,
+        config.topic,
+        config.subscription,
+      );
+      this.tracingService?.endSpan(span, error as Error);
+      throw error;
     }
-
-    // Handle request-response
-    await this.handleRequestResponse(packet, ctx, handler, message.replyTo, receiver, config);
   }
 
   /**
@@ -376,8 +668,10 @@ export class ServiceBusServer extends Server implements CustomTransportStrategy 
       // Complete to prevent redelivery (unlike RMQ NACK, Service Bus doesn't have same semantics)
       try {
         await receiver.completeMessage(ctx.getMessage());
-      } catch {
-        // Ignore
+      } catch (err) {
+        this.serverLogger.debug(
+          `Failed to complete no-event-handler message: ${(err as Error).message}`,
+        );
       }
       return;
     }

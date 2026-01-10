@@ -23,7 +23,11 @@ import {
   ServiceBusDeserializer,
   createServiceBusDeserializer,
 } from '../serializers/service-bus.deserializer';
-import { ServiceBusConnectionError } from '../errors';
+import { ServiceBusConnectionError, ServiceBusCircuitOpenError } from '../errors';
+import { ConnectionManager, CircuitState } from '../utils/connection-manager';
+import { ServiceBusMetricsService } from '../observability/metrics.service';
+import { ServiceBusTracingService } from '../observability/tracing.service';
+import { validateClientOptions } from '../utils/validation.utils';
 
 /**
  * Generates a unique client ID for reply subscriptions
@@ -83,11 +87,39 @@ export class ServiceBusClientProxy extends ClientProxy {
   private status: ServiceBusClientStatus = ServiceBusClientStatus.DISCONNECTED;
   private readonly clientId: string;
   private readonly eventListeners = new Map<string, Set<(...args: any[]) => void>>();
+  private readonly connectionManager: ConnectionManager;
+  private readonly metricsService: ServiceBusMetricsService | null = null;
+  private readonly tracingService: ServiceBusTracingService | null = null;
+  private isReconnecting = false;
 
   constructor(private readonly options: ServiceBusClientOptions) {
     super();
 
+    // Validate options early to fail fast with helpful error messages
+    validateClientOptions(options);
+
     this.clientId = generateClientId();
+
+    // Initialize connection manager for resilience
+    this.connectionManager = new ConnectionManager({
+      name: `ServiceBusClient-${this.clientId}`,
+      reconnect: this.options.reconnect,
+      circuitBreaker: this.options.circuitBreaker,
+    });
+
+    // Forward connection manager events
+    this.setupConnectionManagerEvents();
+
+    // Initialize observability services if configured
+    const observability = this.getOptionsProp(this.options, 'observability');
+    if (observability) {
+      if (observability.metrics) {
+        this.metricsService = new ServiceBusMetricsService(observability.metrics);
+      }
+      if (observability.tracing) {
+        this.tracingService = new ServiceBusTracingService(observability.tracing);
+      }
+    }
 
     // Initialize serializers using getOptionsProp pattern (NestJS convention)
     this.serviceBusSerializer =
@@ -100,6 +132,38 @@ export class ServiceBusClientProxy extends ClientProxy {
     // Set NestJS base class serializers
     this.initializeSerializer(this.options);
     this.initializeDeserializer(this.options);
+  }
+
+  /**
+   * Sets up event forwarding from connection manager
+   */
+  private setupConnectionManagerEvents(): void {
+    this.connectionManager.on('reconnect:start', () => {
+      this.status = ServiceBusClientStatus.RECONNECTING;
+      this.emitEvent('reconnecting');
+    });
+
+    this.connectionManager.on('reconnect:success', () => {
+      this.status = ServiceBusClientStatus.CONNECTED;
+      this.emitEvent('connected');
+    });
+
+    this.connectionManager.on('reconnect:failed', (error) => {
+      this.emitEvent('error', error);
+    });
+
+    this.connectionManager.on('reconnect:exhausted', () => {
+      this.status = ServiceBusClientStatus.DISCONNECTED;
+      this.emitEvent('disconnected', new Error('Reconnection attempts exhausted'));
+    });
+
+    this.connectionManager.on('circuit:open', () => {
+      this.logger.warn('Circuit breaker opened - operations will be rejected');
+    });
+
+    this.connectionManager.on('circuit:close', () => {
+      this.logger.log('Circuit breaker closed - operations resumed');
+    });
   }
 
   // ============ CONNECTION MANAGEMENT ============
@@ -135,6 +199,7 @@ export class ServiceBusClientProxy extends ClientProxy {
       await this.startReplyQueueManager();
 
       this.status = ServiceBusClientStatus.CONNECTED;
+      this.metricsService?.updateConnectionStatus(true);
       this.emitEvent('connected');
       this.logger.log('Connected to Azure Service Bus');
 
@@ -152,6 +217,9 @@ export class ServiceBusClientProxy extends ClientProxy {
    */
   async close(): Promise<void> {
     this.status = ServiceBusClientStatus.CLOSING;
+
+    // Cancel any ongoing reconnection
+    this.connectionManager.cancelReconnect();
 
     // Stop reply queue manager
     if (this.replyQueueManager) {
@@ -174,9 +242,32 @@ export class ServiceBusClientProxy extends ClientProxy {
       this.client = null;
     }
 
+    // Cleanup connection manager
+    this.connectionManager.destroy();
+
     this.status = ServiceBusClientStatus.DISCONNECTED;
+    this.metricsService?.updateConnectionStatus(false);
     this.emitEvent('disconnected');
     this.logger.log('Disconnected from Azure Service Bus');
+
+    // Clear event listeners AFTER emitting disconnected to prevent memory leaks
+    this.eventListeners.clear();
+  }
+
+  /**
+   * Gracefully closes the client, cancelling pending operations
+   * Use this during application shutdown
+   */
+  async gracefulClose(): Promise<void> {
+    this.logger.log('Starting graceful shutdown...');
+
+    // Cancel pending request-response operations
+    if (this.replyQueueManager) {
+      await this.replyQueueManager.cancelAllPending('Client shutting down');
+    }
+
+    // Close normally
+    await this.close();
   }
 
   /**
@@ -187,6 +278,27 @@ export class ServiceBusClientProxy extends ClientProxy {
   }
 
   /**
+   * Gets the current circuit breaker state
+   */
+  getCircuitState(): CircuitState {
+    return this.connectionManager.getCircuitState();
+  }
+
+  /**
+   * Checks if operations can proceed (circuit breaker check)
+   */
+  canProceed(): boolean {
+    return this.connectionManager.canProceed();
+  }
+
+  /**
+   * Manually resets the circuit breaker to closed state
+   */
+  resetCircuit(): void {
+    this.connectionManager.resetCircuit();
+  }
+
+  /**
    * Returns the underlying Azure Service Bus client
    */
   getClient(): AzureServiceBusClient {
@@ -194,6 +306,82 @@ export class ServiceBusClientProxy extends ClientProxy {
       throw new ServiceBusConnectionError('Client not connected. Call connect() first.');
     }
     return this.client;
+  }
+
+  /**
+   * Triggers a reconnection attempt
+   * Useful for manually recovering from connection issues
+   */
+  async reconnect(): Promise<void> {
+    if (this.isReconnecting) {
+      this.logger.debug('Reconnection already in progress');
+      return;
+    }
+
+    this.isReconnecting = true;
+    try {
+      // Close existing connections
+      await this.closeInternal();
+
+      // Reconnect using connection manager
+      await this.connectionManager.reconnect(async () => {
+        await this.connectInternal();
+      });
+    } finally {
+      this.isReconnecting = false;
+    }
+  }
+
+  /**
+   * Internal connect without status management (for reconnection)
+   */
+  private async connectInternal(): Promise<void> {
+    const connectionString = this.getOptionsProp(this.options, 'connectionString');
+    const fullyQualifiedNamespace = this.getOptionsProp(this.options, 'fullyQualifiedNamespace');
+    const credential = this.getOptionsProp(this.options, 'credential');
+    const clientOptions = this.getOptionsProp(this.options, 'clientOptions');
+
+    // Create Azure Service Bus client
+    if (connectionString) {
+      this.client = new AzureServiceBusClient(connectionString, clientOptions);
+    } else if (fullyQualifiedNamespace && credential) {
+      this.client = new AzureServiceBusClient(fullyQualifiedNamespace, credential, clientOptions);
+    } else {
+      throw new ServiceBusConnectionError(
+        'Either connectionString or fullyQualifiedNamespace with credential is required',
+      );
+    }
+
+    // Restart reply queue manager
+    await this.startReplyQueueManager();
+  }
+
+  /**
+   * Internal close without status management (for reconnection)
+   */
+  private async closeInternal(): Promise<void> {
+    // Stop reply queue manager but preserve pending requests
+    if (this.replyQueueManager) {
+      await this.replyQueueManager.stop();
+      this.replyQueueManager = null;
+    }
+
+    // Close all senders
+    const closePromises = Array.from(this.senders.values()).map((sender) =>
+      sender.close().catch((err) => {
+        this.logger.debug(`Error closing sender during reconnect: ${err.message}`);
+      }),
+    );
+    await Promise.all(closePromises);
+    this.senders.clear();
+
+    // Close client
+    if (this.client) {
+      await this.client.close().catch((err) => {
+        this.logger.debug(`Error closing client during reconnect: ${err.message}`);
+      });
+      this.client = null;
+    }
   }
 
   // ============ EVENT EMITTER PATTERN ============
@@ -271,14 +459,37 @@ export class ServiceBusClientProxy extends ClientProxy {
     await this.connect();
 
     const topic = this.getOptionsProp(this.options, 'topic');
-    const sender = await this.getOrCreateSender(topic);
+    const patternStr =
+      typeof packet.pattern === 'string' ? packet.pattern : JSON.stringify(packet.pattern);
 
-    const message = this.serviceBusSerializer.serialize({
-      pattern: packet.pattern,
-      data: packet.data,
-    });
+    // Start tracing span
+    const span = this.tracingService?.startPublishSpan(patternStr, topic) ?? null;
+    const startTime = Date.now();
 
-    await sender.sendMessages(message);
+    try {
+      const sender = await this.getOrCreateSender(topic);
+
+      const message = this.serviceBusSerializer.serialize({
+        pattern: packet.pattern,
+        data: packet.data,
+      });
+
+      // Inject trace context into message
+      if (span) {
+        this.tracingService?.injectContext(message);
+      }
+
+      await sender.sendMessages(message);
+
+      // Record metrics
+      this.metricsService?.recordMessagePublished(topic, patternStr);
+      this.metricsService?.recordPublishLatency(Date.now() - startTime, topic);
+
+      this.tracingService?.endSpan(span);
+    } catch (error) {
+      this.tracingService?.endSpan(span, error as Error);
+      throw error;
+    }
   }
 
   // ============ SCHEDULED MESSAGES ============
@@ -581,11 +792,22 @@ export class ServiceBusClientProxy extends ClientProxy {
     await this.connect();
 
     const requestTimeout = this.getOptionsProp(this.options, 'requestTimeout');
+    const topic = this.getOptionsProp(this.options, 'topic');
+    const patternStr =
+      typeof packet.pattern === 'string' ? packet.pattern : JSON.stringify(packet.pattern);
 
-    // Register for response
+    // Start tracing span
+    const span = this.tracingService?.startPublishSpan(patternStr, topic) ?? null;
+    const startTime = Date.now();
+
+    // Register for response with metrics tracking
     const cleanup = this.replyQueueManager!.registerPendingRequest(
       correlationId,
       (response) => {
+        // Update pending requests metric
+        this.metricsService?.updatePendingRequests(
+          this.replyQueueManager!.getPendingRequestCount(),
+        );
         callback({
           err: response.err,
           response: response.response,
@@ -597,7 +819,6 @@ export class ServiceBusClientProxy extends ClientProxy {
 
     try {
       // Send the request
-      const topic = this.getOptionsProp(this.options, 'topic');
       const sender = await this.getOrCreateSender(topic);
 
       const message = this.serviceBusSerializer.serialize({
@@ -606,11 +827,24 @@ export class ServiceBusClientProxy extends ClientProxy {
         id: correlationId,
       });
 
+      // Inject trace context into message
+      if (span) {
+        this.tracingService?.injectContext(message);
+      }
+
       // Set replyTo header
       message.replyTo = this.replyQueueManager!.getReplyTo();
 
       await sender.sendMessages(message);
+
+      // Record metrics
+      this.metricsService?.recordMessagePublished(topic, patternStr);
+      this.metricsService?.recordPublishLatency(Date.now() - startTime, topic);
+      this.metricsService?.updatePendingRequests(this.replyQueueManager!.getPendingRequestCount());
+
+      this.tracingService?.endSpan(span);
     } catch (error) {
+      this.tracingService?.endSpan(span, error as Error);
       cleanup();
       throw error;
     }
@@ -625,13 +859,42 @@ export class ServiceBusClientProxy extends ClientProxy {
 
   /**
    * Gets or creates a sender for the specified topic
+   * Handles sender recovery if the existing sender is closed
    */
   private async getOrCreateSender(topic: string): Promise<ServiceBusSender> {
-    if (!this.senders.has(topic)) {
-      const sender = this.client!.createSender(topic);
-      this.senders.set(topic, sender);
+    // Check circuit breaker before proceeding
+    if (!this.connectionManager.canProceed()) {
+      const circuitState = this.connectionManager.getCircuitState();
+      throw new ServiceBusCircuitOpenError(
+        `Circuit breaker is ${circuitState}. Operations blocked.`,
+        {
+          resetTimeoutMs: SERVICE_BUS_DEFAULTS.CIRCUIT_BREAKER.RESET_TIMEOUT_MS,
+          failureCount: this.connectionManager.getConsecutiveFailures(),
+        },
+      );
     }
-    return this.senders.get(topic)!;
+
+    const existingSender = this.senders.get(topic);
+
+    // Check if existing sender is still valid
+    if (existingSender && !existingSender.isClosed) {
+      return existingSender;
+    }
+
+    // Sender is closed or doesn't exist - recreate
+    if (existingSender) {
+      this.senders.delete(topic);
+      this.logger.debug(`Recreating closed sender for topic: ${topic}`);
+    }
+
+    // Ensure we're connected
+    if (!this.client) {
+      throw new ServiceBusConnectionError('Client not connected. Call connect() first.');
+    }
+
+    const sender = this.client.createSender(topic);
+    this.senders.set(topic, sender);
+    return sender;
   }
 
   /**

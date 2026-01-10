@@ -3,6 +3,125 @@ import type { ServiceBusClientOptions as AzureClientOptions } from '@azure/servi
 import type { Deserializer, Serializer } from '@nestjs/microservices';
 
 /**
+ * Options for automatic reconnection
+ */
+export interface ReconnectOptions {
+  /**
+   * Whether auto-reconnection is enabled
+   * @default true
+   */
+  enabled?: boolean;
+
+  /**
+   * Maximum number of reconnection attempts
+   * @default Infinity
+   */
+  maxRetries?: number;
+
+  /**
+   * Initial delay between reconnection attempts in milliseconds
+   * @default 1000
+   */
+  initialDelayMs?: number;
+
+  /**
+   * Maximum delay between reconnection attempts in milliseconds
+   * @default 30000
+   */
+  maxDelayMs?: number;
+
+  /**
+   * Multiplier for exponential backoff
+   * @default 2
+   */
+  backoffMultiplier?: number;
+
+  /**
+   * Jitter factor (0-1) to add randomness to delays
+   * @default 0.1
+   */
+  jitterFactor?: number;
+}
+
+/**
+ * Options for circuit breaker pattern
+ */
+export interface CircuitBreakerOptions {
+  /**
+   * Whether circuit breaker is enabled
+   * @default true
+   */
+  enabled?: boolean;
+
+  /**
+   * Number of consecutive failures before opening the circuit
+   * @default 5
+   */
+  failureThreshold?: number;
+
+  /**
+   * Time in milliseconds to wait before attempting to close the circuit
+   * @default 30000
+   */
+  resetTimeoutMs?: number;
+
+  /**
+   * Maximum number of attempts in half-open state before fully opening
+   * @default 3
+   */
+  halfOpenMaxAttempts?: number;
+}
+
+/**
+ * Options for OpenTelemetry observability
+ */
+export interface ObservabilityOptions {
+  /**
+   * Enable OpenTelemetry metrics collection
+   * Set to true to use default meter, or provide custom options
+   * Only activates if @opentelemetry/api is available
+   * @default false
+   */
+  metrics?: boolean | MetricsOptions;
+
+  /**
+   * Enable OpenTelemetry distributed tracing
+   * Set to true to use default tracer, or provide custom options
+   * Only activates if @opentelemetry/api is available
+   * @default false
+   */
+  tracing?: boolean | TracingOptions;
+}
+
+/**
+ * Options for metrics collection
+ */
+export interface MetricsOptions {
+  /**
+   * Custom meter name for metrics
+   * @default 'nestjs-azure-service-bus'
+   */
+  meterName?: string;
+
+  /**
+   * Prefix for all metric names
+   * @default 'service_bus'
+   */
+  prefix?: string;
+}
+
+/**
+ * Options for distributed tracing
+ */
+export interface TracingOptions {
+  /**
+   * Custom tracer name for tracing
+   * @default 'nestjs-azure-service-bus'
+   */
+  tracerName?: string;
+}
+
+/**
  * Retry options for Service Bus operations
  */
 export interface ServiceBusRetryOptions {
@@ -189,6 +308,38 @@ export interface ServiceBusServerOptions {
    * Custom message deserializer
    */
   deserializer?: Deserializer;
+
+  /**
+   * Auto-reconnection options
+   * Enables automatic reconnection when connection is lost
+   */
+  reconnect?: ReconnectOptions;
+
+  /**
+   * Circuit breaker options
+   * Prevents cascade failures during outages
+   */
+  circuitBreaker?: CircuitBreakerOptions;
+
+  /**
+   * OpenTelemetry observability options
+   * Enables metrics and distributed tracing
+   */
+  observability?: ObservabilityOptions;
+
+  /**
+   * Drain timeout during shutdown in milliseconds
+   * Time to wait for in-flight messages to complete
+   * @default 30000
+   */
+  drainTimeoutMs?: number;
+
+  /**
+   * Grace period after stopping receivers in milliseconds
+   * Additional time to wait before closing the client
+   * @default 5000
+   */
+  gracePeriodMs?: number;
 }
 
 /**
@@ -261,6 +412,24 @@ export interface ServiceBusClientOptions {
    * Custom message deserializer
    */
   deserializer?: Deserializer;
+
+  /**
+   * Auto-reconnection options
+   * Enables automatic reconnection when connection is lost
+   */
+  reconnect?: ReconnectOptions;
+
+  /**
+   * Circuit breaker options
+   * Prevents cascade failures during outages
+   */
+  circuitBreaker?: CircuitBreakerOptions;
+
+  /**
+   * OpenTelemetry observability options
+   * Enables metrics and distributed tracing
+   */
+  observability?: ObservabilityOptions;
 }
 
 /**

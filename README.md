@@ -21,7 +21,11 @@ A fully-featured NestJS custom transporter for Azure Service Bus with pub-sub (T
 - **Message Browsing** - Peek messages without consuming them
 - **Deferred Messages** - Defer and retrieve messages by sequence number
 - **Administration Service** - Manage queues, topics, subscriptions, and rules programmatically
-- **Connection Events** - Subscribe to connect/disconnect events for observability
+- **Connection Resilience** - Auto-reconnection with exponential backoff and circuit breaker pattern
+- **OpenTelemetry Observability** - Built-in metrics and distributed tracing support
+- **Health Checks** - NestJS Terminus integration for production monitoring
+- **Graceful Shutdown** - Proper lifecycle management with drain period for in-flight messages
+- **Connection Events** - Subscribe to connect/disconnect/reconnecting events for observability
 - **Comprehensive Error Handling** - Typed errors for connection, authentication, settlement, and session issues
 - **Full NestJS Convention Compliance** - Aligned with official NestJS microservices patterns
 - **Full TypeScript Support** - Complete type definitions included
@@ -547,6 +551,186 @@ This supports:
 - Azure CLI credentials (local development)
 - Environment variables
 - Visual Studio Code credentials
+
+## Connection Resilience
+
+The transporter includes built-in connection resilience with automatic reconnection and circuit breaker patterns.
+
+### Auto-Reconnection
+
+Enable automatic reconnection when the connection to Azure Service Bus is lost:
+
+```typescript
+new ServiceBusServer({
+  connectionString: process.env.SERVICE_BUS_CONNECTION_STRING,
+  subscriptions: [...],
+  // Reconnection options
+  reconnect: {
+    enabled: true,           // Enable auto-reconnection (default: true)
+    maxRetries: Infinity,    // Maximum reconnection attempts
+    initialDelayMs: 1000,    // Initial delay between attempts
+    maxDelayMs: 30000,       // Maximum delay (exponential backoff)
+    backoffMultiplier: 2,    // Backoff multiplier
+    jitterFactor: 0.1,       // Random jitter to prevent thundering herd
+  },
+});
+```
+
+### Circuit Breaker
+
+Prevent cascade failures during outages with the circuit breaker pattern:
+
+```typescript
+new ServiceBusClientProxy({
+  connectionString: process.env.SERVICE_BUS_CONNECTION_STRING,
+  topic: 'orders',
+  // Circuit breaker options
+  circuitBreaker: {
+    enabled: true,           // Enable circuit breaker (default: true)
+    failureThreshold: 5,     // Failures before opening circuit
+    resetTimeoutMs: 30000,   // Time before attempting to close
+    halfOpenMaxAttempts: 3,  // Attempts in half-open state
+  },
+});
+```
+
+The circuit breaker has three states:
+- **CLOSED** - Normal operation, requests flow through
+- **OPEN** - Requests fail immediately (after threshold reached)
+- **HALF_OPEN** - Testing if service recovered
+
+```typescript
+// Check circuit state programmatically
+const state = client.getCircuitState(); // 'closed' | 'open' | 'half_open'
+const canProceed = client.canProceed(); // boolean
+
+// Manually reset the circuit
+client.resetCircuit();
+```
+
+### Connection Events
+
+Subscribe to connection and reconnection events:
+
+```typescript
+client.on('connected', () => console.log('Connected'));
+client.on('disconnected', (error) => console.log('Disconnected:', error?.message));
+client.on('reconnecting', () => console.log('Attempting to reconnect...'));
+client.on('error', (error) => console.error('Error:', error));
+```
+
+## OpenTelemetry Observability
+
+Built-in support for OpenTelemetry metrics and distributed tracing. Install the optional dependency:
+
+```bash
+npm install @opentelemetry/api
+```
+
+### Enabling Observability
+
+```typescript
+new ServiceBusServer({
+  connectionString: process.env.SERVICE_BUS_CONNECTION_STRING,
+  subscriptions: [...],
+  observability: {
+    metrics: true,   // Enable metrics (or { meterName: 'my-app' })
+    tracing: true,   // Enable tracing (or { tracerName: 'my-app' })
+  },
+});
+```
+
+### Metrics Collected
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `service_bus_messages_published_total` | Counter | Messages published |
+| `service_bus_messages_received_total` | Counter | Messages received |
+| `service_bus_messages_completed_total` | Counter | Messages completed |
+| `service_bus_messages_failed_total` | Counter | Messages failed |
+| `service_bus_publish_duration_seconds` | Histogram | Publish latency |
+| `service_bus_handle_duration_seconds` | Histogram | Handler latency |
+| `service_bus_connection_status` | Gauge | Connection status (0/1) |
+| `service_bus_pending_requests` | Gauge | Pending request-response operations |
+
+### Distributed Tracing
+
+Trace context is automatically propagated through message headers, enabling end-to-end tracing across services.
+
+## Health Checks
+
+Integrate with NestJS Terminus for health monitoring. Install the optional dependency:
+
+```bash
+npm install @nestjs/terminus
+```
+
+### Setup
+
+```typescript
+import { ServiceBusHealthModule, ServiceBusHealthIndicator } from '@nestjs-azure/service-bus';
+import { TerminusModule } from '@nestjs/terminus';
+
+@Module({
+  imports: [
+    ServiceBusHealthModule,
+    TerminusModule,
+  ],
+})
+export class AppModule {}
+```
+
+### Health Controller
+
+```typescript
+import { Controller, Get } from '@nestjs/common';
+import { HealthCheck, HealthCheckService } from '@nestjs/terminus';
+import { ServiceBusHealthIndicator, ServiceBusClientProxy } from '@nestjs-azure/service-bus';
+
+@Controller('health')
+export class HealthController {
+  constructor(
+    private health: HealthCheckService,
+    private serviceBusHealth: ServiceBusHealthIndicator,
+    @Inject('ORDER_SERVICE') private client: ServiceBusClientProxy,
+  ) {
+    // Register client for monitoring
+    this.serviceBusHealth.registerClient('orders', client);
+  }
+
+  @Get()
+  @HealthCheck()
+  check() {
+    return this.health.check([
+      () => this.serviceBusHealth.checkClient('serviceBus', 'orders'),
+    ]);
+  }
+}
+```
+
+## Graceful Shutdown
+
+The server automatically handles graceful shutdown when the application stops.
+
+### Configuration
+
+```typescript
+new ServiceBusServer({
+  connectionString: process.env.SERVICE_BUS_CONNECTION_STRING,
+  subscriptions: [...],
+  drainTimeoutMs: 30000,  // Wait for in-flight messages (default: 30s)
+  gracePeriodMs: 5000,    // Additional grace period (default: 5s)
+});
+```
+
+### Behavior
+
+1. On shutdown signal (SIGTERM, etc.), the server stops accepting new messages
+2. Waits for in-flight messages to complete (up to `drainTimeoutMs`)
+3. Waits additional `gracePeriodMs` before closing connections
+4. Closes all subscription managers and the client
+
+The client module also automatically closes all registered clients when the module is destroyed.
 
 ## Configuration Options
 

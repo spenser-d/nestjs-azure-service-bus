@@ -1,6 +1,6 @@
 {
   "name": "@nestjs-azure/service-bus",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A NestJS custom transporter for Azure Service Bus with full pub-sub, session, and dead-letter queue support",
   "author": "Spenser Dubin",
   "license": "MIT",
@@ -50,6 +50,12 @@
   },
   "peerDependenciesMeta": {
     "@azure/identity": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "@nestjs/terminus": {
       "optional": true
     }
   },

@@ -27,3 +27,9 @@ export * from './decorators';
 
 // Utilities
 export * from './utils';
+
+// Observability (OpenTelemetry)
+export * from './observability';
+
+// Health checks
+export * from './health';
